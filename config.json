@@ -1,0 +1,28 @@
+{
+  "host": "play.moovoidsmp.nors.win",
+  "port": 19132,
+  "username": "FishBot",
+  "offline": false,
+  "version": "1.26.51",
+  "hotbarSlot": 0,
+  "castMethod": "auto",
+  "joinMessage": "",
+  "swingArm": false,
+  "recastDelayMs": 900,
+  "maxCastMs": 90000,
+  "castConfirmMs": 3000,
+  "noRodRetryMs": 10000,
+  "reconnectBaseMs": 5000,
+  "reconnectMaxMs": 60000,
+  "statusIntervalMs": 15000,
+  "profilesFolder": "./auth",
+  "logLevel": "info",
+  "logFile": "",
+ "chest": {
+  "enabled": true,
+  "position": { "x": 192, "y": 62, "z": 111 },
+  "everyCatches": 16,
+  "whenFreeSlots": 3,
+  "keepItems": ["minecraft:fishing_rod"]
+}
+}

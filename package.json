@@ -1,0 +1,15 @@
+{
+  "name": "bedrock-afk-fisher",
+  "version": "1.0.0",
+  "private": true,
+  "type": "commonjs",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "bedrock-protocol": "3.60.1"
+  },
+  "engines": {
+    "node": ">=24"
+  }
+}
