@@ -5,7 +5,8 @@ const SILENT_MODE = false;
 const fs = require('node:fs');
 const path = require('node:path');
 const bedrock = require('bedrock-protocol');
-const { Logger, stringify } = require('./logger');
+const { Logger, LEVELS, stringify } = require('./logger');
+const { CommandRouter, SettingsRegistry, settingTypes, registerBuiltinCommands } = require('./commands');
 const { ChestDepositor, loadChestConfig, AIR, lookAtBlock } = require('./chest');
 
 const CONFIG_PATH = path.join(__dirname, 'config.json');
@@ -13,6 +14,9 @@ const CONFIG_PATH = path.join(__dirname, 'config.json');
 const CAST_METHODS = Object.freeze(['auto', 'transaction', 'auth_input']);
 
 const RAKNET_BACKENDS = Object.freeze(['auto', 'raknet-native', 'jsp-raknet']);
+
+// manual: the bot reels in on every bite. auto: an automatic fisher reels; the bot only recasts when its hook is gone.
+const MODES = Object.freeze(['manual', 'auto']);
 
 const ROD_ITEM_NAME = 'minecraft:fishing_rod';
 
@@ -23,6 +27,9 @@ const PLAYER_INVENTORY_SIZE = 36;
 const DEFAULT_CONFIG = Object.freeze({
   offline: false,
   version: '1.26.51',
+  mode: 'manual',
+  commandPrefix: '^',
+  commandUsers: [],
   hotbarSlot: 0,
   autoFindRod: true,
   castMethod: 'auto',
@@ -100,6 +107,18 @@ function loadConfig(configPath = CONFIG_PATH) {
 
   if (!RAKNET_BACKENDS.includes(config.raknetBackend)) {
     throw new Error(`raknetBackend must be one of: ${RAKNET_BACKENDS.join(', ')}`);
+  }
+
+  if (!MODES.includes(config.mode)) {
+    throw new Error(`mode must be one of: ${MODES.join(', ')}`);
+  }
+
+  if (typeof config.commandPrefix !== 'string' || config.commandPrefix === '' || /\s/.test(config.commandPrefix)) {
+    throw new Error('commandPrefix must be a non-empty string without spaces, e.g. "^".');
+  }
+
+  if (!Array.isArray(config.commandUsers) || !config.commandUsers.every((name) => typeof name === 'string')) {
+    throw new Error('commandUsers must be a list of player names allowed to use chat commands, e.g. ["MyGamertag"]. An empty list disables chat commands.');
   }
 
   if (!CAST_METHODS.includes(config.castMethod)) {
@@ -271,6 +290,8 @@ class FishingBot {
     this.greetTimer = null;
     this.shuttingDown = false;
     this.chest = config.chest?.enabled ? new ChestDepositor(config.chest, this.createChestHost(), this.log, config.version) : null;
+    this.settings = this.createSettings();
+    this.commands = this.createCommands();
     this.resetSessionState();
   }
 
@@ -341,7 +362,10 @@ class FishingBot {
     on('start_game', (packet) => this.handleStartGame(packet));
     on('item_registry', (packet) => this.handleItemRegistry(packet));
     on('play_status', (packet) => this.handlePlayStatus(packet));
-    on('text', (packet) => this.log.info('CHAT', `${packet?.source_name ? `<${packet.source_name}> ` : ''}${packet?.message}${packet?.parameters?.length ? ` ${stringify(packet.parameters)}` : ''}`));
+    on('text', (packet) => {
+      this.log.info('CHAT', `${packet?.source_name ? `<${packet.source_name}> ` : ''}${packet?.message}${packet?.parameters?.length ? ` ${stringify(packet.parameters)}` : ''}`);
+      this.handleChat(packet);
+    });
     on('move_player', (packet) => this.handleMovePlayer(packet));
     on('correct_player_move_prediction', (packet) => this.handleMoveCorrection(packet));
     on('inventory_content', (packet) => this.handleInventoryContent(packet));
@@ -615,6 +639,8 @@ class FishingBot {
     this.startStatusReports();
     this.chest?.checkReach(this.position);
     this.scheduleCast(this.config.spawnSettleMs);
+
+    this.log.info('BOT', `Mode: ${this.config.mode}.${this.config.commandUsers.length ? ` Chat commands (${this.config.commandPrefix}help) enabled for: ${this.config.commandUsers.join(', ')}.` : ' Chat commands are off: add player names to commandUsers in config.json to enable them.'}`);
 
     if (this.config.joinMessage) {
       this.greetTimer = setTimeout(() => this.sendChat(this.config.joinMessage), this.config.joinMessageDelayMs);
@@ -990,6 +1016,15 @@ class FishingBot {
       return;
     }
 
+    if (this.config.mode === 'auto') {
+      // The autofisher reeled it in. Stamp the reel time so the loot that follows still counts as our catch.
+      this.lastReelAt = Date.now();
+      this.log.info('FISH', 'Hook is gone (the autofisher reeled it in). Recasting.');
+      clearTimeout(this.castWatchdogTimer);
+      this.scheduleCast(this.config.recastDelayMs);
+      return;
+    }
+
     this.log.warn('FISH', 'Hook vanished without a bite. Recasting.');
     clearTimeout(this.castWatchdogTimer);
     this.scheduleCast(this.config.recastDelayMs);
@@ -1012,6 +1047,12 @@ class FishingBot {
     }
 
     this.biteCount += 1;
+
+    if (this.config.mode === 'auto') {
+      this.log.info('FISH', 'BITE! Autofisher mode: leaving the reel-in to the autofisher.');
+      return;
+    }
+
     this.log.info('FISH', 'BITE! Reeling in.');
     this.reel();
   }
@@ -1099,7 +1140,7 @@ class FishingBot {
 
     this.statusTimer = setInterval(() => {
       const state = this.chest?.busy ? 'depositing' : this.reeling ? 'reeling' : this.hookRuntimeId !== null ? 'waiting for bite' : this.lastCastAt ? 'cast sent, no hook yet' : 'idle';
-      this.log.info('STATUS', `state=${state} method=${this.castMethod}${this.castMethodConfirmed ? '(confirmed)' : '(unconfirmed)'} casts=${this.castCount} rejected=${this.rejectedCasts} bites=${this.biteCount} catches=${this.catchCount}${this.chest ? ` stored=${this.chest.itemsStored} free=${this.chest.freeSlots()}` : ''} heartbeats=${this.authInputsSent} pos=${formatVec(this.position)}`);
+      this.log.info('STATUS', `mode=${this.config.mode} state=${state} method=${this.castMethod}${this.castMethodConfirmed ? '(confirmed)' : '(unconfirmed)'} casts=${this.castCount} rejected=${this.rejectedCasts} bites=${this.biteCount} catches=${this.catchCount}${this.chest ? ` stored=${this.chest.itemsStored} free=${this.chest.freeSlots()}` : ''} heartbeats=${this.authInputsSent} pos=${formatVec(this.position)}`);
     }, this.config.statusIntervalMs);
   }
 
@@ -1214,9 +1255,9 @@ class FishingBot {
     }, delayMs);
   }
 
-  /** Empties loot into the chest first when a deposit is due, then casts. */
+  /** Empties loot into the chest first when a deposit is due, then casts. Auto mode skips deposits: the autofisher collects the loot. */
   startCastCycle() {
-    const reason = this.spawned ? this.chest?.dueReason() : null;
+    const reason = this.spawned && this.config.mode !== 'auto' ? this.chest?.dueReason() : null;
 
     if (!reason) {
       this.cast();
@@ -1243,6 +1284,11 @@ class FishingBot {
       return;
     }
 
+    if (this.config.mode === 'auto' && this.hookRuntimeId !== null) {
+      this.log.verbose('FISH', 'Autofisher mode: our hook is still out, not casting (using the rod would reel it in).');
+      return;
+    }
+
     clearTimeout(this.castWatchdogTimer);
     clearTimeout(this.castConfirmTimer);
     this.hookRuntimeId = null;
@@ -1263,10 +1309,160 @@ class FishingBot {
     this.log.info('FISH', `Cast #${this.castCount} via ${this.castMethod} at ${formatVec(this.position)}, pitch ${this.pitch.toFixed(1)}, yaw ${this.yaw.toFixed(1)}.`);
 
     this.castConfirmTimer = setTimeout(() => this.handleCastNotConfirmed(), this.config.castConfirmMs);
+    this.armCastWatchdog();
+  }
+
+  /**
+   * Arms the "no bite for maxCastMs" recovery reel. Does nothing in auto mode: an autofisher can
+   * legitimately leave the hook out for a long time, and reeling it in ourselves would fight it.
+   */
+  armCastWatchdog() {
+    clearTimeout(this.castWatchdogTimer);
+
+    if (this.config.mode === 'auto') {
+      return;
+    }
+
     this.castWatchdogTimer = setTimeout(() => {
       this.log.warn('FISH', `No bite in ${Math.round(this.config.maxCastMs / 1000)}s. Reeling/recasting in case the hook got stuck.`);
       this.reel(true);
     }, this.config.maxCastMs);
+  }
+
+  /**
+   * Applies a mode change at runtime. Casting and bite handling read `config.mode` live, so only the
+   * watchdog needs to follow: off in auto mode, re-armed in manual mode if a hook is already out.
+   *
+   * @param {string} mode `manual` or `auto`.
+   */
+  applyMode(mode) {
+    this.log.info('BOT', `Mode set to ${mode}${mode === 'auto' ? ': the bot will not reel in, only recast when its hook is gone' : ': the bot will reel in on bites'}.`);
+
+    if (mode === 'auto') {
+      clearTimeout(this.castWatchdogTimer);
+    } else if (this.spawned && this.hookRuntimeId !== null && !this.reeling) {
+      this.armCastWatchdog();
+    }
+  }
+
+  /**
+   * Declares which settings can be changed from chat. To make another config key chat-configurable,
+   * add one `define()` here (and optionally list it in `shortcuts` in {@link FishingBot#createCommands}
+   * to give it its own command like `^mode`).
+   *
+   * @returns {SettingsRegistry} Registry bound to the live config.
+   */
+  createSettings() {
+    const ms = settingTypes.number({ min: 0, integer: true });
+
+    return new SettingsRegistry(this.config)
+      .define({ key: 'mode', type: settingTypes.enum(MODES), description: 'manual = reel in on bites; auto = autofisher reels, bot only recasts', apply: (value) => this.applyMode(value) })
+      .define({ key: 'yaw', type: settingTypes.number({ min: -360, max: 360 }), description: 'Cast direction in degrees (0 south, 90 west, 180 north, -90 east). Applies from the next cast', ...this.aimSetting('yaw') })
+      .define({ key: 'pitch', type: settingTypes.number({ min: -90, max: 90 }), description: 'Cast angle in degrees (positive looks down). Applies from the next cast', ...this.aimSetting('pitch') })
+      .define({ key: 'recastDelayMs', type: ms, description: 'Pause between a reel/hook loss and the next cast' })
+      .define({ key: 'maxCastMs', type: ms, description: 'Manual mode: no-bite time before a recovery reel', apply: () => this.spawned && this.hookRuntimeId !== null && !this.reeling && this.armCastWatchdog() })
+      .define({ key: 'castConfirmMs', type: ms, description: 'How long to wait for the hook before calling a cast ignored' })
+      .define({ key: 'noRodRetryMs', type: ms, description: 'Retry interval when there is no rod' })
+      .define({ key: 'hotbarSlot', type: settingTypes.number({ min: 0, max: 8, integer: true }), description: 'Rod slot, 0 = left-most', apply: (value) => { this.rodSlot = value; } })
+      .define({ key: 'autoFindRod', type: settingTypes.boolean(), description: 'Search the hotbar for a rod instead of only using hotbarSlot' })
+      .define({ key: 'swingArm', type: settingTypes.boolean(), description: 'Send an arm swing with each cast' })
+      .define({ key: 'castMethod', type: settingTypes.enum(CAST_METHODS), description: 'auto, transaction or auth_input', apply: (value) => { this.castMethod = value === 'auto' ? 'transaction' : value; this.castMethodConfirmed = value !== 'auto'; } })
+      .define({ key: 'statusIntervalMs', type: ms, description: 'Status line interval, 0 = off', apply: () => this.spawned && this.startStatusReports() })
+      .define({ key: 'logLevel', type: settingTypes.enum(Object.keys(LEVELS).filter((name) => name !== 'fatal')), description: 'error, warn, info, verbose or trace', apply: (value) => this.log.setLevel(value) });
+  }
+
+  /**
+   * Accessors that let `yaw` / `pitch` act as settings even though config.json stores them as `aim`.
+   *
+   * Reading gives the bot's current look. Writing turns `aim` into explicit angles (replacing a block
+   * target, if there was one) and points the bot there; the heartbeat and the next cast pick it up.
+   * Saving writes `aim: {yaw, pitch}` to config.json.
+   *
+   * @param {'yaw'|'pitch'} axis Which angle.
+   * @returns {{read: Function, write: Function, persist: Function}} Accessors for {@link SettingsRegistry#define}.
+   */
+  aimSetting(axis) {
+    const round = (value) => Number(Number(value).toFixed(3));
+
+    return {
+      read: () => round(this[axis]),
+      write: (value) => {
+        this[axis] = value;
+        this.config.aim = { yaw: this.yaw, pitch: this.pitch };
+      },
+      persist: (onDisk) => {
+        onDisk.aim = { yaw: round(this.yaw), pitch: round(this.pitch) };
+      }
+    };
+  }
+
+  /**
+   * Builds the chat command router. To add a command, `register()` it here; to add a setting, see
+   * {@link FishingBot#createSettings}.
+   *
+   * @returns {CommandRouter} Router for the configured prefix.
+   */
+  createCommands() {
+    const router = new CommandRouter(this.config.commandPrefix);
+
+    registerBuiltinCommands(router, this.settings, { configPath: CONFIG_PATH, shortcuts: ['mode', 'yaw', 'pitch'] });
+
+    router.register({
+      name: 'status',
+      description: 'Mode, state and catch counters',
+      run: () => {
+        const state = this.chest?.busy ? 'depositing' : this.reeling ? 'reeling' : this.hookRuntimeId !== null ? 'waiting for bite' : this.lastCastAt ? 'cast sent, no hook yet' : 'idle';
+        return `mode=${this.config.mode} state=${state} casts=${this.castCount} bites=${this.biteCount} catches=${this.catchCount}${this.chest ? ` stored=${this.chest.itemsStored}` : ''}`;
+      }
+    });
+
+    return router;
+  }
+
+  /** True when a player is listed in `commandUsers` (case-insensitive). */
+  isCommandUser(name) {
+    return this.config.commandUsers.some((allowed) => allowed.toLowerCase() === String(name).toLowerCase());
+  }
+
+  /**
+   * Runs a chat command from an allowed player. Everyone else's `^...` messages are ignored, because
+   * anyone on the server can type in chat.
+   *
+   * @param {object} packet text packet.
+   */
+  handleChat(packet) {
+    const sender = packet?.source_name;
+    const message = packet?.message;
+
+    if (!sender || (packet.type !== 'chat' && packet.type !== 'whisper') || !this.commands.isCommand(message)) {
+      return;
+    }
+
+    if (sender === (this.client?.profile?.name || this.config.username)) {
+      return;
+    }
+
+    if (!this.isCommandUser(sender)) {
+      this.log.warn('CMD', `Ignored command from ${sender} (not in commandUsers): ${message}`);
+      return;
+    }
+
+    this.log.info('CMD', `${sender}: ${message}`);
+    this.commands.dispatch(message, { sender })
+      .then((lines) => this.replyLines(lines))
+      .catch((error) => {
+        this.log.error('CMD', `Command failed: ${error.stack || error.message}`);
+        this.replyLines([`Command failed: ${error.message}`]);
+      });
+  }
+
+  /**
+   * Sends reply lines to chat, spaced out so the server's chat rate limiting doesn't swallow them.
+   *
+   * @param {string[]} lines Reply lines.
+   */
+  replyLines(lines) {
+    lines.forEach((line, index) => setTimeout(() => this.sendChat(line), index * 400));
   }
 
   /** Handles a cast that produced no hook: logs diagnostics and, in auto mode, switches cast method. */

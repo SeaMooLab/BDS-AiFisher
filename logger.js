@@ -109,6 +109,20 @@ class Logger {
   }
 
   /**
+   * Changes the log level at runtime.
+   *
+   * @param {string} level Level name.
+   */
+  setLevel(level) {
+    if (!(level in LEVELS)) {
+      throw new Error(`logLevel must be one of: ${Object.keys(LEVELS).join(', ')}`);
+    }
+
+    this.levelName = level;
+    this.level = LEVELS[level];
+  }
+
+  /**
    * Returns true when messages at the given level will be emitted.
    *
    * @param {string} level Level name.

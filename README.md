@@ -37,6 +37,33 @@ For a server intentionally running offline authentication, set `offline` to `tru
 - Give it 2048 MiB of memory for the first `npm install`, then 512 MiB is plenty.
 - On first start, sign in with the Microsoft code printed in the console (needs `logLevel` of `info` or higher).
 
+## Modes
+
+- `manual` (default): the bot reels in on every bite, then recasts.
+- `auto`: for automatic fishers (e.g. a lava autofisher) that reel the hook in themselves. The bot never reels. It casts once, ignores bites, and recasts after `recastDelayMs` whenever its hook disappears. The no-bite watchdog is disabled, since an autofisher can leave the hook out for a long time.
+
+Set `mode` in `config.json`, or switch live with `^mode auto` / `^mode manual`.
+
+## Chat commands
+
+Add your player name to `commandUsers` in `config.json` (matching is case-insensitive). Commands from anyone else are ignored and logged. With an empty `commandUsers` list, chat commands are off.
+
+| Command | What it does |
+| --- | --- |
+| `^help [command]` | List commands, or describe one |
+| `^mode [manual\|auto]` | Show or switch the mode |
+| `^status` | Mode, state and counters |
+| `^yaw [degrees]` / `^pitch [degrees]` | Show or set the cast direction. Applies from the next cast. `^save` stores it as `aim` in `config.json` (replacing a block target) |
+| `^settings` | List every setting that can be changed from chat |
+| `^get <setting>` | Show a setting, what it accepts and what it does |
+| `^set <setting> <value>` | Change a setting now (lost on restart unless saved) |
+| `^save` | Write settings changed from chat into `config.json` |
+
+### Adding your own
+
+- **A chat-configurable setting:** add one `.define({ key, type, description, apply })` in `createSettings()` in `index.js`. It then works with `^get`, `^set`, `^settings` and `^save`. Types are `settingTypes.enum(...)`, `.boolean()` and `.number({ min, max, integer })`. `apply(value, previous)` runs after a change and may throw to reject it. Add the key to `shortcuts` in `createCommands()` for a dedicated command like `^mode`.
+- **A command:** add a `router.register({ name, aliases, usage, description, run })` in `createCommands()`. `run(args, ctx)` returns a string or an array of lines to reply with, and can throw `CommandError` to send a message back to the player. The generic plumbing lives in `commands.js`.
+
 ## Fishing setup
 
 1. Log the bot account into the server normally once.
@@ -83,6 +110,9 @@ Logs go to the console and to `fishbot.log` (`logFile`; set to `null` to disable
 | `host`, `port`, `username` | required | Server address and account name |
 | `offline` | `false` | `true` only for servers running offline auth |
 | `version` | `1.26.51` | Bedrock protocol version |
+| `mode` | `manual` | `manual` reels in on bites; `auto` is for automatic fishers: never reels, only recasts when its hook is gone |
+| `commandPrefix` | `^` | Prefix for chat commands |
+| `commandUsers` | `[]` | Player names allowed to use chat commands. Empty disables them |
 | `hotbarSlot` | `0` | Rod slot, 0 to 8 (0 = left-most) |
 | `castMethod` | `auto` | `auto`, `transaction`, or `auth_input` |
 | `joinMessage` | `sup losers` | Chat message sent after spawning; `""` to stay quiet |
