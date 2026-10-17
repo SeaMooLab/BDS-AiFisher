@@ -1,9 +1,17 @@
 'use strict';
-
+const SILENT_MODE = true;
 const fs = require('node:fs');
 const path = require('node:path');
 
-const LEVELS = Object.freeze({ error: 0, warn: 1, info: 2, verbose: 3, trace: 4 });
+const LEVELS = Object.freeze({ fatal: -1, error: 0, warn: 1, info: 2, verbose: 3, trace: 4 });
+
+if (SILENT_MODE){
+    console.log("[LOGGER] Silent mode active.");
+    global.console.log = () => {};
+    global.console.warn = () => {};
+    global.console.info = () => {};
+    global.console.error = () => {};
+}
 
 /**
  * Inbound packets that are pure world/entity noise. They are only logged at `trace` level.
@@ -132,6 +140,10 @@ class Logger {
     }
 
     this.stream?.write(`${line}\n`);
+  }
+    
+  fatal(tag, message){
+      this.write('fatal', tag, message);
   }
 
   /** @param {string} tag Subsystem tag. @param {string} message Message text. */

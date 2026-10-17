@@ -1,5 +1,7 @@
 'use strict';
 
+const SILENT_MODE = true;
+
 const fs = require('node:fs');
 const path = require('node:path');
 const bedrock = require('bedrock-protocol');
@@ -45,6 +47,13 @@ const DEFAULT_CONFIG = Object.freeze({
   aim: null,
   chest: undefined
 });
+
+
+if (SILENT_MODE){
+    console.log("Silent mode activated.");
+    global.console.log = () => {};
+}
+
 
 /**
  * Loads, merges and validates the bot configuration.
