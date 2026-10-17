@@ -46,7 +46,9 @@ Set `mode` in `config.json`, or switch live with `^mode auto` / `^mode manual`.
 
 ## Chat commands
 
-Add your player name to `commandUsers` in `config.json` (matching is case-insensitive). Commands from anyone else are ignored and logged. With an empty `commandUsers` list, chat commands are off.
+Send these in normal chat. There is no authorization: anyone who can chat on the server can control the bot, so only use this on a server you trust.
+
+Commands are found anywhere in a chat line and in raw/json (tellraw) messages with `§` codes stripped, so chat rank addons such as Paradox don't break them. The bot ignores its own replies when they are echoed back.
 
 | Command | What it does |
 | --- | --- |
@@ -112,7 +114,6 @@ Logs go to the console and to `fishbot.log` (`logFile`; set to `null` to disable
 | `version` | `1.26.51` | Bedrock protocol version |
 | `mode` | `manual` | `manual` reels in on bites; `auto` is for automatic fishers: never reels, only recasts when its hook is gone |
 | `commandPrefix` | `^` | Prefix for chat commands |
-| `commandUsers` | `[]` | Player names allowed to use chat commands. Empty disables them |
 | `hotbarSlot` | `0` | Rod slot, 0 to 8 (0 = left-most) |
 | `castMethod` | `auto` | `auto`, `transaction`, or `auth_input` |
 | `joinMessage` | `sup losers` | Chat message sent after spawning; `""` to stay quiet |

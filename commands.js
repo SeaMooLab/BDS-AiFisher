@@ -203,6 +203,61 @@ class SettingsRegistry {
   }
 }
 
+/** Text packet types that can carry a chat line (addons like Paradox re-send chat as raw/json). */
+const CHAT_PACKET_TYPES = new Set(['chat', 'whisper', 'announcement', 'raw', 'system', 'json', 'json_whisper', 'json_announcement', 'translation']);
+
+/** Flattens a Bedrock rawtext/tellraw JSON node (`{rawtext: [...]}`, `{text}`, `{translate, with}`) into plain text. */
+function flattenRawText(node) {
+  if (node === null || node === undefined) return '';
+  if (typeof node === 'string') return node;
+  if (Array.isArray(node)) return node.map(flattenRawText).join('');
+  if (typeof node !== 'object') return String(node);
+
+  let out = '';
+  if (typeof node.text === 'string') out += node.text;
+  if (node.rawtext) out += flattenRawText(node.rawtext);
+  if (node.translate) {
+    const parts = Array.isArray(node.with) ? node.with : (node.with?.rawtext ?? []);
+    out += [node.translate, ...parts.map(flattenRawText)].join(' ');
+  }
+
+  return out;
+}
+
+/**
+ * Plain text of a chat-like `text` packet: JSON/rawtext flattened, `§` formatting codes removed.
+ * Returns null for packets that can't be chat (popups, tips, ...).
+ *
+ * @param {object} packet Parsed `text` packet.
+ * @returns {string|null} Plain text.
+ */
+function chatPacketText(packet) {
+  if (!packet || !CHAT_PACKET_TYPES.has(packet.type) || typeof packet.message !== 'string') {
+    return null;
+  }
+
+  let text = packet.message;
+  const trimmed = text.trim();
+
+  if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+    try {
+      text = flattenRawText(JSON.parse(trimmed));
+    } catch {
+      // Not JSON after all; use the message as sent.
+    }
+  }
+
+  if (packet.type === 'translation' && Array.isArray(packet.parameters)) {
+    text = [text, ...packet.parameters].join(' ');
+  }
+
+  return text.replace(/§./g, '').trim();
+}
+
+function escapeRegExp(text) {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 /** Maps `<prefix>name args...` chat messages to handlers. */
 class CommandRouter {
   /**
@@ -247,6 +302,23 @@ class CommandRouter {
   /** True when a chat message looks like a command for this router. */
   isCommand(text) {
     return typeof text === 'string' && text.startsWith(this.prefix) && text.trim().length > this.prefix.length;
+  }
+
+  /**
+   * Finds a command anywhere in a line of chat, so rank/name prefixes added by chat addons
+   * (`[Member] Moo » ^mode auto`) don't matter. Only registered command names match, and the prefix
+   * must not be glued to a preceding letter or digit.
+   *
+   * @param {string} text Plain chat text.
+   * @returns {string|null} The command (prefix included, through the end of the line), or null.
+   */
+  extract(text) {
+    if (typeof text !== 'string') return null;
+
+    const names = [...this.names.keys()].map(escapeRegExp).sort((a, b) => b.length - a.length);
+    const pattern = new RegExp(`(?<![\\p{L}\\p{N}])${escapeRegExp(this.prefix)}(?:${names.join('|')})(?![\\p{L}\\p{N}_])[^\\r\\n]*`, 'iu');
+    const match = pattern.exec(text);
+    return match ? match[0].trim() : null;
   }
 
   /** `^name <usage>` for help and error messages. */
@@ -368,4 +440,4 @@ function registerBuiltinCommands(router, settings, { configPath, shortcuts = [] 
   }
 }
 
-module.exports = { CommandError, CommandRouter, SettingsRegistry, settingTypes, registerBuiltinCommands };
+module.exports = { CommandError, CommandRouter, SettingsRegistry, settingTypes, registerBuiltinCommands, chatPacketText };

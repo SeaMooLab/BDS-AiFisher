@@ -6,7 +6,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const bedrock = require('bedrock-protocol');
 const { Logger, LEVELS, stringify } = require('./logger');
-const { CommandRouter, SettingsRegistry, settingTypes, registerBuiltinCommands } = require('./commands');
+const { CommandRouter, SettingsRegistry, settingTypes, registerBuiltinCommands, chatPacketText } = require('./commands');
 const { ChestDepositor, loadChestConfig, AIR, lookAtBlock } = require('./chest');
 
 const CONFIG_PATH = path.join(__dirname, 'config.json');
@@ -29,7 +29,6 @@ const DEFAULT_CONFIG = Object.freeze({
   version: '1.26.51',
   mode: 'manual',
   commandPrefix: '^',
-  commandUsers: [],
   hotbarSlot: 0,
   autoFindRod: true,
   castMethod: 'auto',
@@ -115,10 +114,6 @@ function loadConfig(configPath = CONFIG_PATH) {
 
   if (typeof config.commandPrefix !== 'string' || config.commandPrefix === '' || /\s/.test(config.commandPrefix)) {
     throw new Error('commandPrefix must be a non-empty string without spaces, e.g. "^".');
-  }
-
-  if (!Array.isArray(config.commandUsers) || !config.commandUsers.every((name) => typeof name === 'string')) {
-    throw new Error('commandUsers must be a list of player names allowed to use chat commands, e.g. ["MyGamertag"]. An empty list disables chat commands.');
   }
 
   if (!CAST_METHODS.includes(config.castMethod)) {
@@ -290,6 +285,7 @@ class FishingBot {
     this.greetTimer = null;
     this.shuttingDown = false;
     this.chest = config.chest?.enabled ? new ChestDepositor(config.chest, this.createChestHost(), this.log, config.version) : null;
+    this.sentChat = [];
     this.settings = this.createSettings();
     this.commands = this.createCommands();
     this.resetSessionState();
@@ -363,7 +359,7 @@ class FishingBot {
     on('item_registry', (packet) => this.handleItemRegistry(packet));
     on('play_status', (packet) => this.handlePlayStatus(packet));
     on('text', (packet) => {
-      this.log.info('CHAT', `${packet?.source_name ? `<${packet.source_name}> ` : ''}${packet?.message}${packet?.parameters?.length ? ` ${stringify(packet.parameters)}` : ''}`);
+      this.log.info('CHAT', `[${packet?.type}] ${packet?.source_name ? `<${packet.source_name}> ` : ''}${chatPacketText(packet) ?? packet?.message}${packet?.parameters?.length ? ` ${stringify(packet.parameters)}` : ''}`);
       this.handleChat(packet);
     });
     on('move_player', (packet) => this.handleMovePlayer(packet));
@@ -640,7 +636,7 @@ class FishingBot {
     this.chest?.checkReach(this.position);
     this.scheduleCast(this.config.spawnSettleMs);
 
-    this.log.info('BOT', `Mode: ${this.config.mode}.${this.config.commandUsers.length ? ` Chat commands (${this.config.commandPrefix}help) enabled for: ${this.config.commandUsers.join(', ')}.` : ' Chat commands are off: add player names to commandUsers in config.json to enable them.'}`);
+    this.log.info('BOT', `Mode: ${this.config.mode}. Chat commands: ${this.config.commandPrefix}help`);
 
     if (this.config.joinMessage) {
       this.greetTimer = setTimeout(() => this.sendChat(this.config.joinMessage), this.config.joinMessageDelayMs);
@@ -668,6 +664,8 @@ class FishingBot {
         platform_chat_id: '',
         has_filtered_message: false
       });
+      this.sentChat.push({ text: message.replace(/§./g, '').trim(), at: Date.now() });
+      this.sentChat = this.sentChat.slice(-50);
       this.log.info('CHAT', `Sent: ${message}`);
     } catch (error) {
       this.log.error('CHAT', `Could not send chat: ${error.message}`);
@@ -1419,36 +1417,42 @@ class FishingBot {
     return router;
   }
 
-  /** True when a player is listed in `commandUsers` (case-insensitive). */
-  isCommandUser(name) {
-    return this.config.commandUsers.some((allowed) => allowed.toLowerCase() === String(name).toLowerCase());
+  /** True when a line of chat contains something we sent in the last minute (chat addons echo our own messages back). */
+  isOwnEcho(text) {
+    const now = Date.now();
+    return this.sentChat.some((sent) => sent.text && now - sent.at < 60000 && text.includes(sent.text));
   }
 
   /**
-   * Runs a chat command from an allowed player. Everyone else's `^...` messages are ignored, because
-   * anyone on the server can type in chat.
+   * Runs a chat command from any player (there is no authorization: anyone who can chat can control
+   * the bot, so only use this on a server you trust).
+   *
+   * Works on the plain text of any chat-like `text` packet (chat, raw, json/tellraw, translation), and finds
+   * the command anywhere in it, because chat addons like Paradox re-send chat with a rank prefix.
    *
    * @param {object} packet text packet.
    */
   handleChat(packet) {
-    const sender = packet?.source_name;
-    const message = packet?.message;
+    const text = chatPacketText(packet);
+    const command = text === null ? null : this.commands.extract(text);
 
-    if (!sender || (packet.type !== 'chat' && packet.type !== 'whisper') || !this.commands.isCommand(message)) {
+    if (!command) {
       return;
     }
 
-    if (sender === (this.client?.profile?.name || this.config.username)) {
+    const sender = packet.source_name;
+
+    if (sender && sender === (this.client?.profile?.name || this.config.username)) {
       return;
     }
 
-    if (!this.isCommandUser(sender)) {
-      this.log.warn('CMD', `Ignored command from ${sender} (not in commandUsers): ${message}`);
+    if (this.isOwnEcho(text)) {
+      this.log.verbose('CMD', `Ignored echo of our own message: ${text}`);
       return;
     }
 
-    this.log.info('CMD', `${sender}: ${message}`);
-    this.commands.dispatch(message, { sender })
+    this.log.info('CMD', `${sender ? `${sender}: ` : ''}${command}`);
+    this.commands.dispatch(command, { sender })
       .then((lines) => this.replyLines(lines))
       .catch((error) => {
         this.log.error('CMD', `Command failed: ${error.stack || error.message}`);
