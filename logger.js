@@ -1,5 +1,5 @@
 'use strict';
-const SILENT_MODE = true;
+const SILENT_MODE = false;
 const fs = require('node:fs');
 const path = require('node:path');
 
