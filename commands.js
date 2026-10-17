@@ -318,7 +318,17 @@ class CommandRouter {
     const names = [...this.names.keys()].map(escapeRegExp).sort((a, b) => b.length - a.length);
     const pattern = new RegExp(`(?<![\\p{L}\\p{N}])${escapeRegExp(this.prefix)}(?:${names.join('|')})(?![\\p{L}\\p{N}_])[^\\r\\n]*`, 'iu');
     const match = pattern.exec(text);
-    return match ? match[0].trim() : null;
+    if (!match) return null;
+
+    // Chat addons sometimes wrap the player's text in quotes (`[Server] "^status"`): drop an unpaired closing quote.
+    let command = match[0].trim();
+    for (const quote of ['"', "'", '”', '’']) {
+      if (command.endsWith(quote) && command.split(quote).length % 2 === 0) {
+        command = command.slice(0, -1).trimEnd();
+      }
+    }
+
+    return command;
   }
 
   /** `^name <usage>` for help and error messages. */

@@ -21,7 +21,7 @@
   "logLevel": "info",
   "logFile": "",
   "aim": {
-    "x": 205
+    "x": 205,
     "y": 62,
     "z": 72
   },
