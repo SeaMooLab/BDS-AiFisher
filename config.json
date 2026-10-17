@@ -4,7 +4,7 @@
   "username": "FishBot",
   "offline": false,
   "version": "1.26.51",
-  "hotbarSlot": 0,
+  "hotbarSlot": 2,
   "castMethod": "auto",
   "joinMessage": "",
   "swingArm": false,
@@ -18,11 +18,22 @@
   "profilesFolder": "./auth",
   "logLevel": "info",
   "logFile": "",
- "chest": {
-  "enabled": true,
-  "position": { "x": 192, "y": 62, "z": 111 },
-  "everyCatches": 16,
-  "whenFreeSlots": 3,
-  "keepItems": ["minecraft:fishing_rod"]
-}
+  "aim": {
+    "x": 184,
+    "y": 62,
+    "z": 111
+  },
+  "chest": {
+    "enabled": true,
+    "position": {
+      "x": 192,
+      "y": 62,
+      "z": 112
+    },
+    "everyCatches": 1,
+    "whenFreeSlots": 3,
+    "keepItems": [
+      "minecraft:fishing_rod"
+    ]
+  }
 }

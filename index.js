@@ -4,7 +4,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const bedrock = require('bedrock-protocol');
 const { Logger, stringify } = require('./logger');
-const { ChestDepositor, loadChestConfig, AIR } = require('./chest');
+const { ChestDepositor, loadChestConfig, AIR, lookAtBlock } = require('./chest');
 
 const CONFIG_PATH = path.join(__dirname, 'config.json');
 
@@ -12,10 +12,17 @@ const CAST_METHODS = Object.freeze(['auto', 'transaction', 'auth_input']);
 
 const RAKNET_BACKENDS = Object.freeze(['auto', 'raknet-native', 'jsp-raknet']);
 
+const ROD_ITEM_NAME = 'minecraft:fishing_rod';
+
+const HOTBAR_SIZE = 9;
+
+const PLAYER_INVENTORY_SIZE = 36;
+
 const DEFAULT_CONFIG = Object.freeze({
   offline: false,
   version: '1.26.51',
   hotbarSlot: 0,
+  autoFindRod: true,
   castMethod: 'auto',
   recastDelayMs: 900,
   maxCastMs: 90000,
@@ -35,6 +42,7 @@ const DEFAULT_CONFIG = Object.freeze({
   logLevel: 'verbose',
   logFile: './fishbot.log',
   debug: false,
+  aim: null,
   chest: undefined
 });
 
@@ -73,6 +81,10 @@ function loadConfig(configPath = CONFIG_PATH) {
     throw new Error('hotbarSlot must be an integer from 0 through 8. Slot 0 is the left-most hotbar slot.');
   }
 
+  if (typeof config.autoFindRod !== 'boolean') {
+    throw new Error('autoFindRod must be true (search the hotbar for a rod) or false (only use hotbarSlot).');
+  }
+
   if (typeof config.joinMessage !== 'string') {
     throw new Error('joinMessage must be a string. Use "" to stay quiet.');
   }
@@ -92,9 +104,31 @@ function loadConfig(configPath = CONFIG_PATH) {
     }
   }
 
+  validateAim(config.aim);
   config.chest = loadChestConfig(config.chest);
 
   return config;
+}
+
+/**
+ * Validates the optional `aim` setting: null (use the account's saved look), a block to cast at
+ * `{x, y, z}`, or explicit angles `{yaw, pitch}`.
+ *
+ * @param {*} aim The `aim` value from config.json.
+ * @throws {Error} If it is malformed.
+ */
+function validateAim(aim) {
+  if (aim === null || aim === undefined) {
+    return;
+  }
+
+  const isNum = (value) => typeof value === 'number' && Number.isFinite(value);
+  const isBlock = ['x', 'y', 'z'].every((axis) => isNum(aim[axis]));
+  const isAngles = isNum(aim.yaw) && isNum(aim.pitch) && aim.pitch >= -90 && aim.pitch <= 90;
+
+  if (!isBlock && !isAngles) {
+    throw new Error('aim must be null, a spot in the water to cast at like {"x": 190, "y": 62, "z": 112}, or angles like {"yaw": 90, "pitch": 30} (yaw: 0 south, 90 west, 180 north, -90 east; pitch: positive looks down).');
+  }
 }
 
 /**
@@ -234,16 +268,23 @@ class FishingBot {
   /**
    * Builds the callbacks the chest depositor uses to act through this bot.
    *
+   * `rodSlot` is a live getter, so the depositor always protects whichever hotbar slot the bot
+   * is currently fishing with, even after it switches to a spare rod.
+   *
    * @returns {import('./chest').ChestHost} Host adapter.
    */
   createChestHost() {
+    const bot = this;
+
     return {
       send: (name, params) => this.send(name, params),
       useItem: (data, method) => this.sendItemUse(data, method),
       preferredMethod: () => this.castMethod,
       inventory: () => this.inventorySlots,
-      heldItem: () => this.inventorySlots[this.config.hotbarSlot] ?? AIR,
-      rodSlot: this.config.hotbarSlot,
+      heldItem: () => this.inventorySlots[this.rodSlot] ?? AIR,
+      get rodSlot() {
+        return bot.rodSlot;
+      },
       position: () => this.position,
       getLook: () => ({ pitch: this.pitch, yaw: this.yaw }),
       setLook: (pitch, yaw) => {
@@ -251,7 +292,8 @@ class FishingBot {
         this.yaw = yaw;
       },
       itemName: (item) => this.itemNames.get(Number(item?.network_id)),
-      describeItem: (item) => this.describeItem(item)
+      describeItem: (item) => this.describeItem(item),
+      blockIdsAreHashes: () => this.blockIdsAreHashes
     };
   }
 
@@ -298,6 +340,8 @@ class FishingBot {
     on('player_hotbar', (packet) => this.handlePlayerHotbar(packet));
     on('add_entity', (packet) => this.handleAddEntity(packet));
     on('remove_entity', (packet) => this.handleRemoveEntity(packet));
+    on('move_entity', (packet) => this.trackHook(packet.runtime_entity_id, packet.position));
+    on('move_entity_delta', (packet) => this.trackHook(packet.runtime_entity_id, packet));
     on('entity_event', (packet) => this.handleEntityEvent(packet));
     on('add_item_entity', (packet) => this.handleAddItemEntity(packet));
     on('container_open', (packet) => this.chest?.handleContainerOpen(packet));
@@ -325,13 +369,16 @@ class FishingBot {
     this.yaw = 0;
     this.tick = 0n;
     this.inventorySlots = [];
+    this.rodSlot = this.config.hotbarSlot;
     this.hookRuntimeId = null;
     this.hookUniqueId = null;
+    this.hookPosition = null;
     this.lastCastAt = 0;
     this.lastReelAt = 0;
     this.pendingTeleportAck = false;
     this.pendingItemUses = [];
     this.serverSelectedSlot = null;
+    this.blockIdsAreHashes = undefined;
     this.loadingScreenStarted = false;
     this.spawnPending = false;
     this.authInputsSent = 0;
@@ -349,6 +396,7 @@ class FishingBot {
     clearTimeout(this.recastTimer);
     clearTimeout(this.reconnectTimer);
     clearTimeout(this.greetTimer);
+    clearTimeout(this.bobberReportTimer);
     this.heartbeatTimer = null;
     this.statusTimer = null;
     this.castWatchdogTimer = null;
@@ -385,8 +433,10 @@ class FishingBot {
     this.position = packet.player_position || this.position;
     this.pitch = Number(packet.rotation?.x || 0);
     this.yaw = Number(packet.rotation?.z || 0);
+    this.applyAim();
 
     this.tick = 0n;
+    this.blockIdsAreHashes = packet.block_network_ids_are_hashes;
 
     if (Array.isArray(packet.itemstates)) {
       this.handleItemRegistry({ itemstates: packet.itemstates });
@@ -394,6 +444,10 @@ class FishingBot {
 
     this.log.info('BOT', `start_game: pos ${formatVec(this.position)}, pitch ${this.pitch.toFixed(1)}, yaw ${this.yaw.toFixed(1)}, gamemode ${packet.player_gamemode}, unique id ${entityKey(this.uniqueEntityId)}, runtime id ${entityKey(this.runtimeEntityId)}, world tick ${packet.current_tick} (input ticks start at 0 like vanilla), permission ${packet.permission_level}`);
     this.log.verbose('BOT', `server-auth inventory: ${packet.server_authoritative_inventory}, server-auth block breaking: ${packet.server_authoritative_block_breaking}, engine: ${packet.engine ?? 'n/a'}`);
+
+    if (this.chest) {
+      this.log.info('CHEST', `Server block ids are ${packet.block_network_ids_are_hashes ? 'hashed (bot computes chest ids itself)' : 'NOT hashed (bot relies on the server telling it the chest id)'}.`);
+    }
 
     if (this.chest && packet.server_authoritative_inventory === false) {
       this.log.warn('CHEST', 'Server does not report server-authoritative inventory. Chest deposits use item stack requests and may be refused here.');
@@ -599,19 +653,37 @@ class FishingBot {
       this.position = packet.position;
     }
 
-    if (packet.pitch !== undefined) {
+    const teleported = packet.mode === 'teleport' || packet.mode === 'reset';
+
+    if (teleported && packet.pitch !== undefined) {
       this.pitch = Number(packet.pitch);
     }
 
-    if (packet.yaw !== undefined) {
+    if (teleported && packet.yaw !== undefined) {
       this.yaw = Number(packet.yaw);
     }
 
-    if (packet.mode === 'teleport' || packet.mode === 'reset') {
+    if (teleported) {
       this.pendingTeleportAck = true;
+      this.applyAim();
     }
 
     this.log.verbose('MOVE', `Server moved bot (${packet.mode}) to ${formatVec(this.position)}, pitch ${this.pitch.toFixed(1)}, yaw ${this.yaw.toFixed(1)}`);
+  }
+
+  /**
+   * Points the bot where `aim` says (a water block or explicit angles). Without `aim` the account's saved look is kept.
+   */
+  applyAim() {
+    const aim = this.config.aim;
+    if (!aim) {
+      return;
+    }
+
+    const look = Number.isFinite(aim.yaw) ? { yaw: aim.yaw, pitch: aim.pitch } : lookAtBlock(this.position, aim);
+    this.yaw = look.yaw;
+    this.pitch = look.pitch;
+    this.log.info('BOT', `Aiming ${Number.isFinite(aim.yaw) ? 'at the configured angles' : `at block ${aim.x}, ${aim.y}, ${aim.z}`}: yaw ${look.yaw.toFixed(1)}, pitch ${look.pitch.toFixed(1)}.`);
   }
 
   /**
@@ -680,25 +752,119 @@ class FishingBot {
 
     this.inventorySlots[packet.slot] = packet.item;
 
-    if (packet.slot === this.config.hotbarSlot) {
+    if (packet.slot === this.rodSlot) {
       this.log.verbose('INV', `Rod slot ${packet.slot} updated by server: ${this.describeItem(packet.item)}`);
+      if (this.config.autoFindRod && !this.isRod(packet.item)) {
+        this.log.warn('INV', `Rod in hotbar slot ${packet.slot} is gone (broke or was moved). Will look for another rod on the next cast.`);
+      }
     } else {
       this.log.trace('INV', `Slot ${packet.slot} updated: ${this.describeItem(packet.item)}`);
     }
   }
 
-  /** Warns when the configured slot does not hold a fishing rod. */
+  /** Logs which hotbar slot will be fished with, or why none can be. Runs whenever the full inventory arrives. */
   checkRodSlot() {
-    const item = this.inventorySlots[this.config.hotbarSlot];
-    const name = this.itemNames.get(Number(item?.network_id));
+    try {
+      const slot = this.locateRod();
+      const item = this.inventorySlots[slot];
+      const name = this.itemNames.get(Number(item?.network_id));
 
-    if (!item || item.network_id === 0) {
-      this.log.warn('INV', `Hotbar slot ${this.config.hotbarSlot} (slot ${this.config.hotbarSlot + 1} counting from 1) is EMPTY.`);
-    } else if (name && name !== 'minecraft:fishing_rod') {
-      this.log.warn('INV', `Hotbar slot ${this.config.hotbarSlot} holds ${name}, not minecraft:fishing_rod. Fix hotbarSlot in config.json.`);
-    } else {
-      this.log.info('INV', `Rod slot ${this.config.hotbarSlot}: ${this.describeItem(item)}`);
+      if (name && name !== ROD_ITEM_NAME) {
+        this.log.warn('INV', `Hotbar slot ${slot} holds ${name}, not ${ROD_ITEM_NAME}. Fix hotbarSlot in config.json or set autoFindRod to true.`);
+      } else {
+        this.log.info('INV', `Rod slot ${slot}: ${this.describeItem(item)}`);
+      }
+    } catch (error) {
+      this.log.warn('INV', error.message);
     }
+  }
+
+  /**
+   * Returns true when a stack is a fishing rod, matched by registry name (numeric ids vary by version/server).
+   *
+   * @param {object|undefined} item ItemV4 stack.
+   * @returns {boolean} Whether the stack is a usable fishing rod.
+   */
+  isRod(item) {
+    if (!item || item.network_id === 0 || item.count === 0) {
+      return false;
+    }
+
+    return this.itemNames.get(Number(item.network_id)) === ROD_ITEM_NAME;
+  }
+
+  /**
+   * Scans the hotbar for a fishing rod.
+   *
+   * Search order keeps the bot from flip-flopping between rods: the slot it is already using first,
+   * then the configured `hotbarSlot`, then slots 0-8 left to right.
+   *
+   * @returns {number} Hotbar slot (0-8) holding a rod, or -1 when the hotbar has none.
+   */
+  findRodSlot() {
+    const order = [this.rodSlot, this.config.hotbarSlot];
+    for (let slot = 0; slot < HOTBAR_SIZE; slot += 1) {
+      order.push(slot);
+    }
+
+    return order.find((slot) => this.isRod(this.inventorySlots[slot])) ?? -1;
+  }
+
+  /**
+   * Points {@link FishingBot#rodSlot} at a hotbar slot that holds a rod.
+   *
+   * With `autoFindRod` off, the configured `hotbarSlot` is used as-is (old behavior: whatever item is
+   * there gets used). With it on, the hotbar is searched and the switch is logged.
+   *
+   * @returns {number} The hotbar slot to fish with.
+   * @throws {Error} If no usable rod is available.
+   */
+  locateRod() {
+    if (!this.inventorySlots.length) {
+      throw new Error('Inventory NOT received from the server yet.');
+    }
+
+    if (!this.config.autoFindRod) {
+      const item = this.inventorySlots[this.config.hotbarSlot];
+      if (!item || item.network_id === 0 || item.count === 0) {
+        throw new Error(`Hotbar slot ${this.config.hotbarSlot} (slot ${this.config.hotbarSlot + 1} counting from 1) is EMPTY. Put the fishing rod there.`);
+      }
+
+      this.rodSlot = this.config.hotbarSlot;
+      return this.rodSlot;
+    }
+
+    const slot = this.findRodSlot();
+    if (slot === -1) {
+      throw new Error(this.describeMissingRod());
+    }
+
+    if (slot !== this.rodSlot) {
+      this.log.info('INV', `Found a fishing rod in hotbar slot ${slot} (slot ${slot + 1} counting from 1); switching to it from slot ${this.rodSlot}.`);
+      this.rodSlot = slot;
+    }
+
+    return this.rodSlot;
+  }
+
+  /**
+   * Explains why no rod was found, pointing out rods stuck in the main inventory where the bot can't select them.
+   *
+   * @returns {string} Human-readable reason.
+   */
+  describeMissingRod() {
+    const backpackRods = [];
+    for (let slot = HOTBAR_SIZE; slot < Math.min(this.inventorySlots.length, PLAYER_INVENTORY_SIZE); slot += 1) {
+      if (this.isRod(this.inventorySlots[slot])) {
+        backpackRods.push(slot);
+      }
+    }
+
+    if (backpackRods.length) {
+      return `No fishing rod in the hotbar, but inventory slot(s) ${backpackRods.join(', ')} have one. Drag a rod into the hotbar (slots 1-9).`;
+    }
+
+    return 'No fishing rod anywhere in the hotbar (or inventory). Give the bot a rod.';
   }
 
   /**
@@ -754,7 +920,10 @@ class FishingBot {
 
     this.hookRuntimeId = packet.runtime_id;
     this.hookUniqueId = packet.unique_id;
+    this.hookPosition = { ...packet.position };
     clearTimeout(this.castConfirmTimer);
+    clearTimeout(this.bobberReportTimer);
+    this.bobberReportTimer = setTimeout(() => this.reportBobber(), 2500);
 
     if (!this.castMethodConfirmed) {
       this.castMethodConfirmed = true;
@@ -762,6 +931,36 @@ class FishingBot {
     }
 
     this.log.info('FISH', `Hook is in the water (runtime ${entityKey(this.hookRuntimeId)}). Waiting for a bite...`);
+  }
+
+  /**
+   * Records the latest position of this bot's hook from move_entity / move_entity_delta.
+   *
+   * @param {*} runtimeId Entity runtime id from the packet.
+   * @param {{x?: number, y?: number, z?: number}|undefined} position New absolute coordinates (delta packets may omit axes).
+   */
+  trackHook(runtimeId, position) {
+    if (this.hookRuntimeId === null || !position || entityKey(runtimeId) !== entityKey(this.hookRuntimeId)) {
+      return;
+    }
+
+    for (const axis of ['x', 'y', 'z']) {
+      if (Number.isFinite(position[axis])) {
+        this.hookPosition[axis] = position[axis];
+      }
+    }
+  }
+
+  /** Logs where the bobber ended up after a cast, so a hook stuck on a block can be found. */
+  reportBobber() {
+    if (this.hookRuntimeId === null || !this.hookPosition) {
+      return;
+    }
+
+    const p = this.hookPosition;
+    const block = `${Math.floor(p.x)}, ${Math.floor(p.y)}, ${Math.floor(p.z)}`;
+    const distance = Math.hypot(p.x - this.position.x, p.z - this.position.z);
+    this.log.info('FISH', `Bobber landed at ${formatVec(p)} (block ${block}), ${distance.toFixed(1)} blocks out.${distance < 2 ? ' That is right in front of him: it is probably stuck on a block, not in the water.' : ''}`);
   }
 
   /**
@@ -896,39 +1095,34 @@ class FishingBot {
   }
 
   /**
-   * Returns the exact inventory item in the configured rod slot.
+   * Returns the exact inventory stack of the rod, searching the hotbar first when `autoFindRod` is on.
    *
    * @returns {object} ItemV4 rod stack as last sent by the server.
-   * @throws {Error} If the slot is empty.
+   * @throws {Error} If no usable rod is available.
    */
   getRodItem() {
-    const item = this.inventorySlots[this.config.hotbarSlot];
-
-    if (!item || item.network_id === 0 || item.count === 0) {
-      throw new Error(`No usable item found in hotbar slot ${this.config.hotbarSlot} (inventory ${this.inventorySlots.length ? 'received' : 'NOT received yet'}). Put the fishing rod there.`);
-    }
-
-    return item;
+    return this.inventorySlots[this.locateRod()];
   }
 
   /**
-   * Selects the configured hotbar slot using the exact server-supplied item stack.
+   * Selects the rod's hotbar slot using the exact server-supplied item stack.
    *
    * Like vanilla, the slot switch is only sent when the server's selected slot differs.
    */
   selectRod() {
     const item = this.getRodItem();
 
-    if (this.serverSelectedSlot === this.config.hotbarSlot) {
+    if (this.serverSelectedSlot === this.rodSlot) {
       return;
     }
 
-    this.serverSelectedSlot = this.config.hotbarSlot;
+    this.log.verbose('INV', `Selecting hotbar slot ${this.rodSlot} (server had ${this.serverSelectedSlot ?? 'unknown'}).`);
+    this.serverSelectedSlot = this.rodSlot;
     this.send('mob_equipment', {
       runtime_entity_id: this.runtimeEntityId,
       item,
-      slot: this.config.hotbarSlot,
-      selected_slot: this.config.hotbarSlot,
+      slot: this.rodSlot,
+      selected_slot: this.rodSlot,
       window_id: 'inventory'
     });
   }
@@ -949,7 +1143,7 @@ class FishingBot {
       trigger_type: 'unknown',
       block_position: { x: 0, y: 0, z: 0 },
       face: 255,
-      hotbar_slot: this.config.hotbarSlot,
+      hotbar_slot: this.rodSlot,
       hand: 'main_hand',
       held_item: item,
       player_pos: this.position,

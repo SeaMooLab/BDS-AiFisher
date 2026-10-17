@@ -8,6 +8,8 @@
  * `item_stack_request` packets, then closes the chest and goes back to fishing. The rod slot is never touched.
  */
 
+const { containerBlockIds } = require('./blockids');
+
 let mcData = null;
 try {
   mcData = require('minecraft-data');
@@ -27,8 +29,25 @@ const DEFAULT_CHEST_CONFIG = Object.freeze({
   closeTimeoutMs: 1500,
   retryAfterFailureMs: 300000,
   maxReach: 5.5,
+  probeTimeoutMs: 1200,
+  clickSpacingMs: 100,
   blockRuntimeId: null
 });
+
+/** Player eye height above the feet; Bedrock player positions are eye level. */
+const EYE_HEIGHT = 1.62;
+
+/**
+ * Offsets from the bot's feet block that `position: "auto"` tries, nearest and most likely first:
+ * the four sides at foot level, the four sides one block down, the diagonals, then the four sides at head level.
+ */
+const AUTO_OFFSETS = Object.freeze([
+  [1, 0, 0], [-1, 0, 0], [0, 0, 1], [0, 0, -1],
+  [1, -1, 0], [-1, -1, 0], [0, -1, 1], [0, -1, -1],
+  [1, 0, 1], [1, 0, -1], [-1, 0, 1], [-1, 0, -1],
+  [1, -1, 1], [1, -1, -1], [-1, -1, 1], [-1, -1, -1],
+  [1, 1, 0], [-1, 1, 0], [0, 1, 1], [0, 1, -1]
+]);
 
 /** Main inventory size (hotbar 0-8 + backpack 9-35). */
 const PLAYER_INVENTORY_SLOTS = 36;
@@ -36,8 +55,35 @@ const PLAYER_INVENTORY_SLOTS = 36;
 /** ContainerSlotType names the server may use when reporting player inventory slots. */
 const PLAYER_CONTAINER_TYPES = new Set(['hotbar', 'inventory', 'hotbar_and_inventory']);
 
-/** Wire value of the `place` stack request action, repeated as `legacy_type_id` since 1.26.40. */
+/** Wire values of the `take` / `place` stack request actions, repeated as `legacy_type_id` since 1.26.40. */
+const TAKE_ACTION_ID = 0;
 const PLACE_ACTION_ID = 1;
+
+/** Container names that can be a block's storage window. Anything else the server reports is ignored. */
+const STORAGE_CONTAINER_TYPES = Object.freeze(['container', 'barrel', 'shulker']);
+
+/**
+ * Builds every known way to address an inventory -> chest move, most common first. Servers differ in which they
+ * accept (vanilla's chest screen, the player inventory screen, shift-click vs. pick-up-and-drop), so the bot
+ * tries them in order and keeps the first one that works.
+ *
+ * @param {string|undefined} reported Container name the server reported for the open window.
+ * @returns {Array<{dest: string, source: string, flow: string, label: string}>} Strategies.
+ */
+function moveStrategies(reported) {
+  const dests = [...new Set([STORAGE_CONTAINER_TYPES.includes(reported) ? reported : 'container', 'container', 'barrel'])];
+  const strategies = [];
+
+  for (const dest of dests) {
+    for (const flow of ['direct', 'cursor']) {
+      for (const source of ['split', 'combined']) {
+        strategies.push({ dest, source, flow, label: `${flow === 'direct' ? 'shift-click' : 'pick up + drop'} from ${source === 'split' ? 'hotbar/inventory' : 'hotbar_and_inventory'} into ${dest}` });
+      }
+    }
+  }
+
+  return strategies;
+}
 
 /** Block faces: 0 down, 1 up, 2 north (-z), 3 south (+z), 4 west (-x), 5 east (+x). */
 const FACE = Object.freeze({ DOWN: 0, UP: 1, NORTH: 2, SOUTH: 3, WEST: 4, EAST: 5 });
@@ -67,8 +113,8 @@ function loadChestConfig(raw) {
   }
 
   const pos = chest.position;
-  if (!pos || !['x', 'y', 'z'].every((axis) => Number.isInteger(pos[axis]))) {
-    throw new Error('chest.position must be the chest block coordinates as whole numbers, e.g. {"x": 200, "y": 64, "z": 176}. Turn on "Show Coordinates" in-game and stand on/next to the chest to read them.');
+  if (pos !== 'auto' && (!pos || !['x', 'y', 'z'].every((axis) => Number.isInteger(pos[axis])))) {
+    throw new Error('chest.position must be "auto" (search the blocks around the bot) or the chest block coordinates as whole numbers, e.g. {"x": 200, "y": 64, "z": 176}.');
   }
 
   for (const key of ['everyCatches', 'whenFreeSlots']) {
@@ -81,7 +127,7 @@ function loadChestConfig(raw) {
     throw new Error('chest.everyCatches and chest.whenFreeSlots are both 0, so the bot would never deposit.');
   }
 
-  for (const key of ['openTimeoutMs', 'actionTimeoutMs', 'closeTimeoutMs', 'retryAfterFailureMs', 'maxReach']) {
+  for (const key of ['openTimeoutMs', 'actionTimeoutMs', 'closeTimeoutMs', 'retryAfterFailureMs', 'maxReach', 'probeTimeoutMs', 'clickSpacingMs']) {
     if (!Number.isFinite(chest[key]) || chest[key] < 0) {
       throw new Error(`chest.${key} must be a non-negative number.`);
     }
@@ -241,6 +287,44 @@ function faceTowards(eye, block) {
 }
 
 /**
+ * Returns the block the bot's feet are in.
+ *
+ * @param {{x: number, y: number, z: number}} eye Bot eye position.
+ * @returns {{x: number, y: number, z: number}} Feet block coordinates.
+ */
+function feetBlock(eye) {
+  return { x: Math.floor(eye.x), y: Math.floor(eye.y - EYE_HEIGHT + 0.01), z: Math.floor(eye.z) };
+}
+
+/**
+ * Lists the blocks around the bot that `position: "auto"` tries, in order.
+ *
+ * @param {{x: number, y: number, z: number}} eye Bot eye position.
+ * @returns {Array<{x: number, y: number, z: number}>} Candidate chest positions.
+ */
+function autoCandidates(eye) {
+  const feet = feetBlock(eye);
+  return AUTO_OFFSETS.map(([dx, dy, dz]) => ({ x: feet.x + dx, y: feet.y + dy, z: feet.z + dz }));
+}
+
+/**
+ * @param {{x: number, y: number, z: number}} a Block position.
+ * @param {{x: number, y: number, z: number}} b Block position.
+ * @returns {boolean} Whether both are the same block.
+ */
+function samePos(a, b) {
+  return Boolean(a && b) && a.x === b.x && a.y === b.y && a.z === b.z;
+}
+
+/**
+ * @param {{x: number, y: number, z: number}} pos Block position.
+ * @returns {string} Map key.
+ */
+function posKey(pos) {
+  return `${pos.x},${pos.y},${pos.z}`;
+}
+
+/**
  * Promise-based waits for specific server packets, with timeouts and bulk abort on disconnect.
  */
 class PacketWaiter {
@@ -310,6 +394,7 @@ class PacketWaiter {
  * @property {function(number, number): void} setLook Sets look angles sent by the heartbeat.
  * @property {function(object): string|undefined} itemName Namespaced item name for a stack.
  * @property {function(object): string} describeItem Human-readable stack description.
+ * @property {function(): (boolean|undefined)} blockIdsAreHashes start_game `block_network_ids_are_hashes`.
  */
 
 /**
@@ -329,8 +414,15 @@ class ChestDepositor {
     this.stackSize = createStackSizeLookup(version);
     this.waiter = new PacketWaiter();
     this.keep = new Set(settings.keepItems);
-    this.blockRuntimeId = settings.blockRuntimeId ?? 0;
+    this.target = settings.position === 'auto' ? null : { ...settings.position };
+    this.blockRuntimeIds = new Map();
+    this.workingIds = new Map();
+    this.version = version;
+    this.hashedIds = null;
     this.workingMethod = null;
+    this.strategy = null;
+    this.strategies = [];
+    this.lastRefusal = '';
     this.catchesSinceDeposit = 0;
     this.retryAt = 0;
     this.nextRequestId = -1;
@@ -344,6 +436,8 @@ class ChestDepositor {
     this.busy = false;
     this.window = null;
     this.windowContents = new Map();
+    this.windowContainers = new Map();
+    this.retryAt = 0;
     this.waiter.abort('session reset');
   }
 
@@ -364,7 +458,13 @@ class ChestDepositor {
    * @param {{x: number, y: number, z: number}} eye Bot eye position.
    */
   checkReach(eye) {
-    const pos = this.settings.position;
+    const pos = this.target;
+    if (!pos) {
+      const feet = feetBlock(eye);
+      this.log.info('CHEST', `Chest position is "auto": on the first deposit the bot tries the blocks around ${feet.x}, ${feet.y}, ${feet.z} until one opens. Depositing every ${this.settings.everyCatches || 'n/a'} catches or when <= ${this.settings.whenFreeSlots} free slots.`);
+      return;
+    }
+
     const distance = Math.hypot(pos.x + 0.5 - eye.x, pos.y + 0.5 - eye.y, pos.z + 0.5 - eye.z);
     const message = `Chest at ${pos.x}, ${pos.y}, ${pos.z} is ${distance.toFixed(1)} blocks away.`;
 
@@ -423,6 +523,10 @@ class ChestDepositor {
       return null;
     }
 
+    if (this.settings.everyCatches === 1) {
+      return 'new items in inventory';
+    }
+
     const free = this.freeSlots();
     if (this.settings.whenFreeSlots > 0 && free <= this.settings.whenFreeSlots) {
       return `inventory almost full (${free} free slots)`;
@@ -446,9 +550,8 @@ class ChestDepositor {
     }
 
     this.window = packet;
-    const pos = this.settings.position;
     const coords = packet.coordinates;
-    if (coords && (coords.x !== pos.x || coords.y !== pos.y || coords.z !== pos.z)) {
+    if (this.target && coords && !samePos(coords, this.target)) {
       this.log.verbose('CHEST', `Opened container at ${coords.x}, ${coords.y}, ${coords.z} (other half of a double chest?).`);
     }
     this.waiter.feed('container_open', packet);
@@ -477,6 +580,9 @@ class ChestDepositor {
     }
 
     this.windowContents.set(packet.window_id, packet.input.slice());
+    if (packet.container?.container_id) {
+      this.windowContainers.set(packet.window_id, packet.container);
+    }
     this.waiter.feed('inventory_content', packet);
   }
 
@@ -498,14 +604,65 @@ class ChestDepositor {
    * @param {object} packet update_block packet.
    */
   handleUpdateBlock(packet) {
-    const pos = this.settings.position;
-    const p = packet.position;
-    if (p && p.x === pos.x && p.y === pos.y && p.z === pos.z && packet.layer === 0 && this.settings.blockRuntimeId === null) {
-      if (this.blockRuntimeId !== packet.block_runtime_id) {
-        this.log.verbose('CHEST', `Learned chest block runtime id ${packet.block_runtime_id}.`);
-      }
-      this.blockRuntimeId = packet.block_runtime_id;
+    if (!packet.position || packet.layer !== 0) {
+      return;
     }
+
+    const key = posKey(packet.position);
+    if (this.busy || this.blockRuntimeIds.has(key) || samePos(packet.position, this.target)) {
+      if (this.busy && this.blockRuntimeIds.get(key) !== packet.block_runtime_id) {
+        const known = this.containerIds().find((entry) => entry.id === packet.block_runtime_id);
+        this.log.info('CHEST', `Server resynced block ${formatPos(packet.position)}: runtime id ${packet.block_runtime_id}${known ? ` (${known.label})` : ''}.`);
+      }
+      this.blockRuntimeIds.set(key, packet.block_runtime_id);
+    }
+  }
+
+  /**
+   * Hashed ids of every closed chest / trapped chest / barrel state, when the server uses hashed block ids.
+   *
+   * @returns {Array<{id: number, label: string}>} Candidates, or an empty list on servers without hashed ids.
+   */
+  containerIds() {
+    if (this.host.blockIdsAreHashes() === false) {
+      return [];
+    }
+
+    this.hashedIds ??= containerBlockIds(this.version);
+    return this.hashedIds;
+  }
+
+  /**
+   * Orders the block runtime ids to try when clicking a block: configured, previously working, learned from
+   * the server, then (when `full`) every container state's hashed id, then 0.
+   *
+   * @param {{x: number, y: number, z: number}} pos Block position.
+   * @param {boolean} full Include every container id rather than only plain chests.
+   * @returns {number[]} Distinct ids, most likely first.
+   */
+  runtimeIdCandidates(pos, full) {
+    const key = posKey(pos);
+    const ids = [];
+    const add = (id) => {
+      if (Number.isInteger(id) && !ids.includes(id)) {
+        ids.push(id);
+      }
+    };
+
+    if (this.settings.blockRuntimeId !== null && samePos(pos, this.target)) {
+      add(this.settings.blockRuntimeId);
+    }
+    for (const id of this.workingIds.get(key) || []) {
+      add(id);
+    }
+    add(this.blockRuntimeIds.get(key));
+
+    const containers = this.containerIds();
+    for (const entry of full ? containers : containers.filter((c) => c.label.startsWith('chest['))) {
+      add(entry.id);
+    }
+    add(0);
+    return ids;
   }
 
   /**
@@ -533,19 +690,14 @@ class ChestDepositor {
     this.busy = true;
     this.window = null;
     this.windowContents.clear();
+    this.windowContainers.clear();
     const savedLook = this.host.getLook();
     let moved = 0;
 
     this.log.info('CHEST', `Depositing loot: ${reason}.`);
 
     try {
-      if (this.settings.lookAtChest) {
-        const look = lookAtBlock(this.host.position(), this.settings.position);
-        this.host.setLook(look.pitch, look.yaw);
-        await delay(150);
-      }
-
-      const window = await this.open();
+      const window = this.target ? await this.open() : await this.findChest();
       const chestSlots = await this.awaitContents(window);
       this.log.verbose('CHEST', `Chest opened (window ${window.window_id}, ${chestSlots.length} slots, ${chestSlots.filter(isAir).length} empty).`);
 
@@ -575,25 +727,27 @@ class ChestDepositor {
   }
 
   /**
-   * Builds the click-block use-item payload for the chest.
+   * Builds the click-block use-item payload for a block.
    *
+   * @param {{x: number, y: number, z: number}} pos Block to click.
+   * @param {number} runtimeId Block runtime id to report for that block.
    * @returns {object} TransactionUseItem fields.
    */
-  buildClickData() {
+  buildClickData(pos, runtimeId) {
     const eye = this.host.position();
-    const { face, clickPos } = faceTowards(eye, this.settings.position);
+    const { face, clickPos } = faceTowards(eye, pos);
 
     return {
       action_type: 'click_block',
       trigger_type: 'player_input',
-      block_position: { ...this.settings.position },
+      block_position: { ...pos },
       face,
       hotbar_slot: this.host.rodSlot,
       hand: 'main_hand',
       held_item: this.host.heldItem(),
       player_pos: eye,
       click_pos: clickPos,
-      block_runtime_id: this.blockRuntimeId,
+      block_runtime_id: runtimeId,
       client_prediction: 'success',
       client_cooldown_state: 'off'
     };
@@ -608,25 +762,107 @@ class ChestDepositor {
   async open() {
     const first = this.workingMethod || this.host.preferredMethod();
     const second = first === 'transaction' ? 'auth_input' : 'transaction';
-    const attempts = [first, second, first];
 
-    for (const method of attempts) {
-      const opened = this.waiter.wait('container_open', () => true, this.settings.openTimeoutMs);
-      this.host.useItem(this.buildClickData(), method);
-
+    for (const method of [first, second]) {
       try {
-        const packet = await opened;
-        if (this.workingMethod !== method) {
-          this.log.info('CHEST', `Chest opens with the "${method}" method.`);
-        }
-        this.workingMethod = method;
-        return packet;
+        return await this.tryOpen(this.target, method, this.settings.openTimeoutMs, this.runtimeIdCandidates(this.target, true));
       } catch (error) {
         this.log.warn('CHEST', `Chest did not open via ${method} (${error.message}).`);
       }
     }
 
-    throw new Error(`the chest at ${formatPos(this.settings.position)} never opened. Check the coordinates, that nothing solid sits on top of it, that it is within reach, and that the bot may open containers here (claims/plot protection)`);
+    throw new Error(`the chest at ${formatPos(this.target)} never opened. Check the coordinates, that nothing solid sits on top of it, that it is within reach, and that the bot may open containers here (claims/plot protection)`);
+  }
+
+  /**
+   * Faces a block and right-clicks it once per candidate block runtime id (a vanilla server ignores clicks whose
+   * id doesn't match the block), stopping as soon as a container opens.
+   *
+   * @param {{x: number, y: number, z: number}} pos Block to click.
+   * @param {string} method `transaction` or `auth_input`.
+   * @param {number} timeoutMs How long to wait for container_open after the last click.
+   * @param {number[]} runtimeIds Block runtime ids to try, in order.
+   * @returns {Promise<object>} The container_open packet.
+   * @throws {Error} On timeout.
+   */
+  async tryOpen(pos, method, timeoutMs, runtimeIds) {
+    if (this.settings.lookAtChest) {
+      const look = lookAtBlock(this.host.position(), pos);
+      this.host.setLook(look.pitch, look.yaw);
+      await delay(150);
+    }
+
+    const key = posKey(pos);
+    const { face } = faceTowards(this.host.position(), pos);
+    const queue = runtimeIds.slice();
+    const sent = [];
+    let opened = null;
+    this.window = null;
+    this.log.verbose('CHEST', `Clicking ${formatPos(pos)} face ${face} via ${method}, trying ${queue.length} block id(s): ${queue.join(', ')}`);
+
+    while (queue.length > 0 && !this.window) {
+      const learned = this.blockRuntimeIds.get(key);
+      const runtimeId = learned !== undefined && !sent.includes(learned) ? learned : queue.shift();
+      if (sent.includes(runtimeId)) {
+        continue;
+      }
+
+      sent.push(runtimeId);
+      this.host.useItem(this.buildClickData(pos, runtimeId), method);
+      await delay(this.settings.clickSpacingMs);
+    }
+
+    if (!this.window) {
+      opened = this.waiter.wait('container_open', () => true, timeoutMs);
+      const learned = this.blockRuntimeIds.get(key);
+      if (learned !== undefined && !sent.includes(learned)) {
+        sent.push(learned);
+        this.host.useItem(this.buildClickData(pos, learned), method);
+      }
+    }
+
+    const packet = this.window || await opened;
+    this.workingIds.set(key, sent.slice().reverse());
+
+    if (this.workingMethod !== method) {
+      this.log.info('CHEST', `Containers open with the "${method}" method.`);
+    }
+    this.workingMethod = method;
+    return packet;
+  }
+
+  /**
+   * For `position: "auto"`: clicks the blocks around the bot until one opens as a container, then remembers it.
+   *
+   * @returns {Promise<object>} The container_open packet.
+   * @throws {Error} When nothing nearby opens.
+   */
+  async findChest() {
+    const candidates = autoCandidates(this.host.position());
+    const first = this.workingMethod || this.host.preferredMethod();
+    const other = first === 'transaction' ? 'auth_input' : 'transaction';
+    const passes = [
+      { method: first, ids: (pos) => [this.blockRuntimeIds.get(posKey(pos)) ?? 0] },
+      { method: first, ids: (pos) => this.runtimeIdCandidates(pos, false) },
+      { method: other, ids: (pos) => this.runtimeIdCandidates(pos, false) }
+    ];
+
+    for (const pass of passes) {
+      this.log.info('CHEST', `Searching ${candidates.length} blocks around the bot for a chest (via ${pass.method})...`);
+
+      for (const pos of candidates) {
+        try {
+          const packet = await this.tryOpen(pos, pass.method, this.settings.probeTimeoutMs, pass.ids(pos));
+          this.target = pos;
+          this.log.info('CHEST', `FOUND the chest at ${formatPos(pos)}. To skip the search next time, set "position": {"x": ${pos.x}, "y": ${pos.y}, "z": ${pos.z}} in config.json.`);
+          return packet;
+        } catch (error) {
+          this.log.verbose('CHEST', `Nothing opened at ${formatPos(pos)} (${error.message}).`);
+        }
+      }
+    }
+
+    throw new Error('no chest opened in any block around the bot. Put it right next to him (touching his block, same level or one lower), make sure nothing solid sits on top of it, and that the bot is allowed to open containers there');
   }
 
   /**
@@ -651,6 +887,9 @@ class ChestDepositor {
   async moveAll(chestSlots) {
     let moved = 0;
     let failures = 0;
+    const reported = this.windowContainers.get(this.window?.window_id)?.container_id;
+    this.strategies = moveStrategies(reported);
+    this.log.verbose('CHEST', `Server calls this window "${reported ?? 'n/a'}". Move method: ${this.strategy ? this.strategy.label : 'not known yet, will try each'}.`);
 
     for (const slot of this.depositableSlots()) {
       if (!this.window) {
@@ -695,7 +934,7 @@ class ChestDepositor {
       }
 
       const count = Math.min(item.count, destination.space);
-      const ok = await this.place(slot, destination.slot, count, chestSlots);
+      const ok = await this.moveWithStrategy(slot, destination.slot, count, chestSlots);
 
       if (ok) {
         moved += count;
@@ -716,45 +955,67 @@ class ChestDepositor {
   }
 
   /**
-   * Sends one `place` item stack request and applies the server's answer.
+   * Moves items with the known-good strategy, or, until one is known, tries each strategy until the server
+   * accepts one and remembers it.
    *
    * @param {number} fromSlot Player inventory slot.
    * @param {number} toSlot Chest slot.
    * @param {number} count Items to move.
    * @param {Array<object>} chestSlots Chest contents.
    * @returns {Promise<boolean>} True when the server accepted the move.
+   * @throws {Error} When no strategy works at all.
    */
-  async place(fromSlot, toSlot, count, chestSlots) {
+  async moveWithStrategy(fromSlot, toSlot, count, chestSlots) {
+    if (this.strategy) {
+      return this.place(fromSlot, toSlot, count, chestSlots, this.strategy);
+    }
+
+    const refusals = [];
+    for (const strategy of this.strategies) {
+      const result = await this.place(fromSlot, toSlot, count, chestSlots, strategy);
+      if (result) {
+        this.strategy = strategy;
+        this.log.info('CHEST', `Item moves work via ${strategy.label}.`);
+        return true;
+      }
+      refusals.push(`${strategy.label}: ${this.lastRefusal}`);
+      this.log.info('CHEST', `Server refused ${strategy.label} (${this.lastRefusal}).`);
+    }
+
+    throw new Error(`the server refused every way of moving items into the chest:\n  ${refusals.join('\n  ')}`);
+  }
+
+  /**
+   * Sends one item stack request moving items from the player inventory into the chest, and applies the answer.
+   *
+   * @param {number} fromSlot Player inventory slot.
+   * @param {number} toSlot Chest slot.
+   * @param {number} count Items to move.
+   * @param {Array<object>} chestSlots Chest contents.
+   * @param {{dest: string, source: string, flow: string}} strategy How to address the move.
+   * @returns {Promise<boolean>} True when the server accepted the move.
+   */
+  async place(fromSlot, toSlot, count, chestSlots, strategy) {
     const inventory = this.host.inventory();
     const source = inventory[fromSlot];
     const destination = chestSlots[toSlot];
     const requestId = this.nextRequestId;
     this.nextRequestId -= 2;
 
-    const response = this.waiter.wait('item_stack_response', (r) => r.request_id === requestId, this.settings.actionTimeoutMs);
+    const sourceContainer = strategy.source === 'combined' ? 'hotbar_and_inventory' : fromSlot < 9 ? 'hotbar' : 'inventory';
+    const sourceInfo = { slot_type: { container_id: sourceContainer, dynamic_container_id: undefined }, slot: fromSlot, stack_id: stackIdOf(source) };
+    const destInfo = { slot_type: { container_id: strategy.dest, dynamic_container_id: undefined }, slot: toSlot, stack_id: stackIdOf(destination) };
+    const cursor = (stackId) => ({ slot_type: { container_id: 'cursor', dynamic_container_id: undefined }, slot: 0, stack_id: stackId });
 
-    this.host.send('item_stack_request', {
-      requests: [{
-        request_id: requestId,
-        actions: [{
-          type_id: 'place',
-          legacy_type_id: PLACE_ACTION_ID,
-          count,
-          source: {
-            slot_type: { container_id: fromSlot < 9 ? 'hotbar' : 'inventory', dynamic_container_id: undefined },
-            slot: fromSlot,
-            stack_id: stackIdOf(source)
-          },
-          destination: {
-            slot_type: { container_id: 'container', dynamic_container_id: undefined },
-            slot: toSlot,
-            stack_id: stackIdOf(destination)
-          }
-        }],
-        custom_names: [],
-        cause: 'chat_public'
-      }]
-    });
+    const actions = strategy.flow === 'cursor'
+      ? [
+        { type_id: 'take', legacy_type_id: TAKE_ACTION_ID, count, source: sourceInfo, destination: cursor(0) },
+        { type_id: 'place', legacy_type_id: PLACE_ACTION_ID, count, source: cursor(requestId), destination: destInfo }
+      ]
+      : [{ type_id: 'place', legacy_type_id: PLACE_ACTION_ID, count, source: sourceInfo, destination: destInfo }];
+
+    const response = this.waiter.wait('item_stack_response', (r) => r.request_id === requestId, this.settings.actionTimeoutMs);
+    this.host.send('item_stack_request', { requests: [{ request_id: requestId, actions, custom_names: [], cause: 'chat_public' }] });
 
     let answer;
     try {
@@ -764,7 +1025,8 @@ class ChestDepositor {
     }
 
     if (answer.status !== 'ok') {
-      this.log.verbose('CHEST', `Move ${fromSlot} -> chest ${toSlot} x${count} rejected (status ${answer.status}).`);
+      this.lastRefusal = `status ${answer.status}`;
+      this.log.verbose('CHEST', `Move ${fromSlot} -> chest ${toSlot} x${count} via ${strategy.label} rejected (status ${answer.status}).`);
       return false;
     }
 
@@ -792,6 +1054,9 @@ class ChestDepositor {
 
     for (const container of containers || []) {
       const type = container.slot_type?.container_id;
+      if (type === 'cursor') {
+        continue;
+      }
       const target = PLAYER_CONTAINER_TYPES.has(type) ? inventory : chestSlots;
 
       for (const info of container.slots || []) {
@@ -872,8 +1137,11 @@ module.exports = {
   loadChestConfig,
   normalizeItemName,
   pickDestination,
+  moveStrategies,
   lookAtBlock,
   faceTowards,
+  feetBlock,
+  autoCandidates,
   canMerge,
   isAir,
   createStackSizeLookup
